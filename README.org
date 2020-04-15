@@ -1,0 +1,966 @@
+#+TITLE: Hello, World! (A deep dive) 
+#+AUTHOR: Yaspr
+#+DATE: April 2020
+
+* Introduction
+
+   This tutorial is a dissection of a simple hello world program aimed at exposing
+   the software layers between the program and the hardware. 
+
+   The programs will be written in C and x86 assembly under Linux (Kernel 5.0.9)
+   with GCC version 8.3.0, GNU libc version 2.29, and GNU Binutils version 2.32.
+   
+   This tutorial requires some knowledge of C programming using GCC in a Linux
+   environment along with solid notions of the binary and hexadecimal numeric systems.
+   
+   Some basic knowledge of x86 assembly is also required. 
+
+
+* Hello, World!
+
+** The jump before the dive
+
+  Let's start by first writing the most naive implementation.
+   
+#+BEGIN_SRC c
+
+   #incldue <stdio.h> // For printf
+
+   int main(void) // Program entry point, no parameters
+   {
+      printf("Hello, World!\n"); //Printing 
+       
+      return 0; //Return code 0
+   }
+
+#+END_SRC
+   
+
+  In the Linux C environment, . 'stdio' stands for standard input/output. The standard output (stdout) is the screen, 
+  and the standard input is the keyboard; both are exposed as files (in UNIX, everything 
+  is a file) to the user space. Just like any other file, they have descriptors that allow access 
+  for reading (from stdin) or writing (to stdout) bytes. The GNU C library (libc) provides a myriad of high level 
+  functions (printf, scanf, getc, putc, gets, puts, fread, ...), and global variables (stdin, stdout, ...) that 
+  C programmers can use to stay away from the low level instricacies of IO management. 
+   
+       - stdin has a file descriptor value of 0.
+       - stdout has a file descriptor value of 1.
+   
+  Let's compile this program and examine the outputs.
+
+#+BEGIN_SRC shell
+   
+   $ gcc main.c -o main
+
+#+END_SRC
+
+   After compilation, the generated binary file is 16560 bytes (16KiB) long.
+   This is HUGE for a simple hello world program. Let's dive deeper!
+   
+   Let's look at which libraries are loaded by the binary using the *ldd* command:
+   
+#+BEGIN_SRC shell
+   
+   $ ldd main 
+           linux-vdso.so.1 (0x00007f0f36a74000)
+           libc.so.6 => /usr/lib/libc.so.6 (0x00007f0f36872000)
+           /lib64/ld-linux-x86-64.so.2 => /usr/lib64/ld-linux-x86-64.so.2 (0x00007f0f36a75000)
+ 
+#+END_SRC
+
+   We can notice that The binary file uses the following libraries:
+
+   1. linux-vdso.so (Virtual Dynamic Shared Object)
+
+   2. libc.so       (GNU C library)
+
+   3. ld-linux-x86-64.so (shared libraries loader)
+
+   Now, let's disassemble the binary file using the *objdump* command:
+   
+#+BEGIN_SRC shell
+
+   $ objdump -D ./main
+
+#+END_SRC
+ 
+   There is A LOT of code in this binary file, but we are only interested in the *main* function:
+  
+#+BEGIN_SRC asm
+
+      0000000000001139 <main>:
+      1139:       55                      push   %rbp
+      113a:       48 89 e5                mov    %rsp,%rbp
+      113d:       48 8d 3d c0 0e 00 00    lea    0xec0(%rip),%rdi        # 2004 <_IO_stdin_used+0x4>
+      1144:       e8 e7 fe ff ff          callq  1030 <puts@plt>
+      1149:       b8 00 00 00 00          mov    $0x0,%eax
+      114e:       5d                      pop    %rbp
+      114f:       c3                      retq   
+      
+#+END_SRC 
+   
+  Let's analyze the assembly code instruction per instructio. The first two instructions (1139 & 113a) save rbp 
+  to the stack and then store the stack pointer in rbp.
+  This is used to handle *main* parameters (command line parameters). In the C code, the *main* function
+  is defined without parameters: *int main(void)*. These two instructions are therefore unnecessary.
+      
+  The third instruction (*lea*: load effective address) calculates the address of the ="Hello, World!"= string and stores it in the 
+  rdi register. 
+  The rip register contains an address, and 0xec0 is the offset from this address to where the string starts. 
+  The string is stored in the .rodata (/ro/ as in /read only/) section. This section is part of the binary file and is loaded in memory with the 
+  program. It usually contains program constants (i.e. strings).
+     
+  The string address is calculated and stored in the rdi register using the *lea* instruction, therefore, rdi = rip + 0xec0.
+   
+   To examine the .rodata section we are going to specify the section name to *objdump*:   
+
+#+BEGIN_SRC shell
+      
+   $ objdump -d -s -j .rodata ./main 
+
+     Contents of section .rodata:
+     2000 01000200 48656c6c 6f2c2057 6f726c64  ....Hello, World
+     2010 2100                                 !.              
+     
+#+END_SRC
+      
+   From this output, we can observe that the .rodata section starts at address 0x2000 and that the string starts 4 bytes further (address 0x2004).
+   Let's look closely at the content of the rdi register.
+   
+   1) We know rdi = rip + 0xec0
+ 
+   2) We know that the string is stored at address 0x2004.
+      Therefore, rip + 0xec0 should be equal to 0x2004.
+
+   Let's calculate the value of rip:
+
+#+BEGIN_EXAMPLE
+
+   rip + 0xec0 = 0x2004
+   rip = 0x2004 - 0xec0 = 0x1144
+
+#+END_EXAMPLE
+   
+  Looking back at the assembly code, address 0x1144 points at the call instruction to *puts*. 
+  What this means is that the compiler calculated the string address using the current instruction position.
+  This makes total sense given that the rip register is the instruction pointer (ip).
+   
+  The fourth instruction calls the *puts* function. This function is implemented in the GNU C library and 
+  its address is stored in the plt section, hence the *puts@plt*. The plt section is used to locate library functions 
+  whose addresses are not known at link time.
+   
+  According to the manual (man 3 puts), the *puts* function takes one parameter, a string.
+
+#+BEGIN_SRC c
+
+   int puts(const char *s);
+
+#+END_SRC
+
+  Given that we know that rdi contains the address of the string to be printed, we can safely assume that *puts*
+  gets its parameter value from rdi. Why is it so? The simplest answer: *ABI* (Application Binary Interface). 
+  
+  An *ABI* generally describes the data types (size, encoding, ...), the structure of functions and function calls, ... 
+  relative to a low level hardware format. For example, the calling conventions of an *ABI* describe how a call to a
+  function is to be performed, which registers to set according to which function parameter, which register should hold
+  the function's return value, ... 
+  
+  In our case, we're interested in the *x86-64 SYSTEM V AMD64 ABI*, the standard in the UNIX world. 
+  This *ABI* states that when a call to a function is placed, the following registers are to be used, in order, and 
+  depending on the number of function parameters:
+  
+#+BEGIN_EXAMPLE
+
+   RDI, RSI, RDX, RCX, R8, R9, XMM0 to XMM7
+   
+   RDI holds the first parameter value
+   RSI holds the second parameter value
+   ...
+
+#+END_EXAMPLE
+
+  The return value of a function is stored in the rax register, or rax:rdx if the value requires more than 64 bits.    
+  Again, this makes sense. Nothing to report.
+  
+  The fifth instruction clears eax (why eax? it's a 32 bit register, aren't we in 64 bit mode?)
+  
+  On x86 processors, registers are named/addressed as follows (example describing the anatomy of the rax register):
+      
+#+BEGIN_EXAMPLE
+
+      al : low byte  (8 bits)
+      ah : high byte (8 bits)
+      
+      ax : 2 bytes (16 bits)
+
+      eax: 4 bytes (32 bits)
+
+      rax: 8 bytes (64 bits)
+
+     |---+---+---+---+-----+---+----+----|
+     | . | . | . | . |  .  | . | ah | al | High 8bits and low 8 bits
+     |---+---+---+---+-----+---+----+----|
+     | . | . | . | . |  .  | . |   ax    | 16 bits
+     |---+---+---+---+-----+---+----+----| 
+     | . | . | . | . |        eax        | 32 bits
+     |---+---+---+---+-----+---+----+----|
+     |                  rax              | 64 bits
+     |---+---+---+---+-----+---+----+----|
+
+#+END_EXAMPLE
+			      
+  The reason behind why the compiler used eax lies in the fact that in 64bit mode, the mov instruction 
+  clears the higher 32 bits automatically when a 32bit register is passed. 
+   
+  Excerpt from the Intel documentation regarding the *mov* instruction:
+
+#+BEGIN_EXAMPLE
+   
+   The upper bits of the destination register are zero for most IA-32 processors (Pentium Pro processors and later) and all Intel 64 processors, 
+   with the exception that bits 31:16 are undefined for Intel Quark X1000 processors, Pentium and earlier processors.
+   
+#+END_EXAMPLE
+
+  The sixth instruction restores the previously saved rbp value into rbp. This is useless. 
+
+  The last instruction sets the instruction pointer to after the function call to continue execution. 
+
+      
+   _Observations:_
+
+   The first oddity with this assembly code is that there is no sign of *printf*. In the C program, a *printf*
+   call was made to print the desired string, but, after examining the assembly code, it is quite clear that
+   the compiler replaced the *printf* call with the *puts* call. Why?! 
+   
+   Well, according to the manual, the *printf* function is defined as follows:
+   
+#+BEGIN_SRC c
+
+   int printf(const char *format, ...);
+
+#+END_SRC
+
+  Obviously, this function takes a variable number of parameters (...) and a format. The *printf* function is very tricky and its code
+  must be complex compared to *puts* which takes only one parameter. 
+   
+  Given that we didn't use any format that requires additional processing, the compiler optimized the code and used a more suitable 
+  function for the code's needs.
+  
+  Going back to the compilation line, no optimization flag was specified, and, by default, GCC disables all optimizations (-O0) if no flag is
+  explicitly set (-O1, -O2, ...). 
+
+  Obviously, GCC does not consider this a "real" optimization, rather common sense.  
+  
+  Wait?! What if we set optimization flags?
+  
+  - Using -O1 optimization flag:
+  
+#+BEGIN_SRC asm
+   
+   0000000000001139 <main>:
+   1139:       48 83 ec 08             sub    $0x8,%rsp
+   113d:       48 8d 3d c0 0e 00 00    lea    0xec0(%rip),%rdi        # 2004 <_IO_stdin_used+0x4>
+   1144:       e8 e7 fe ff ff          callq  1030 <puts@plt>
+   1149:       b8 00 00 00 00          mov    $0x0,%eax
+   114e:       48 83 c4 08             add    $0x8,%rsp
+   1152:       c3                      retq   
+   1153:       66 2e 0f 1f 84 00 00    nopw   %cs:0x0(%rax,%rax,1)
+   115a:       00 00 00 
+   115d:       0f 1f 00                nopl   (%rax)
+      
+#+END_SRC
+   
+  - Using -O2 and -O3 optimization flags:   
+
+#+BEGIN_SRC asm
+
+   0000000000001040 <main>:
+   1040:       48 83 ec 08             sub    $0x8,%rsp
+   1044:       48 8d 3d b9 0f 00 00    lea    0xfb9(%rip),%rdi        # 2004 <_IO_stdin_used+0x4>
+   104b:       e8 e0 ff ff ff          callq  1030 <puts@plt>
+   1050:       31 c0                   xor    %eax,%eax
+   1052:       48 83 c4 08             add    $0x8,%rsp
+   1056:       c3                      retq   
+   1057:       66 0f 1f 84 00 00 00    nopw   0x0(%rax,%rax,1)
+   105e:       00 00 
+   
+#+END_SRC
+
+  - Using -Os
+
+#+BEGIN_SRC asm
+   
+   0000000000001040 <main>:
+   1040:       50                      push   %rax
+   1041:       48 8d 3d bc 0f 00 00    lea    0xfbc(%rip),%rdi        # 2004 <_IO_stdin_used+0x4>
+   1048:       e8 e3 ff ff ff          callq  1030 <puts@plt>
+   104d:       31 c0                   xor    %eax,%eax
+   104f:       5a                      pop    %rdx
+   1050:       c3                      retq   
+   1051:       66 2e 0f 1f 84 00 00    nopw   %cs:0x0(%rax,%rax,1)
+   1058:       00 00 00 
+   105b:       0f 1f 44 00 00          nopl   0x0(%rax,%rax,1)
+   
+#+END_SRC
+   
+  _Observations:_
+   
+  . No stack operations for -O1, -O2, and -O3 
+  
+  . New instructions: *nopw* and *nopl* (these are prefetch instructions that bring data to the CPU cache before it is requested)
+  
+  . -Os doesn't affect the size of the binary file
+  
+  Nothing spectacular so far. The binary file is still 16KiB and is relying on the glibc.
+
+  
+** Mid-jump conclusion 
+   
+  Even when full optimizations are activated, gcc won't produce a smaller hello world program.
+  And, the binary is dragging too many unnecessary glibc constructs.
+  
+  Now, let's beat GCC and make a much smaller binary.
+  
+
+* Hello, World! - Syscalls
+
+  First, we need to get rid of the glibc and the dynamic linking. For this, we will directly rely on the 
+  Operating System (Linux) by using system calls.
+  System calls are a way to request low level kernel operations from user space. All input and output functions
+  of the glibc are implemented using system calls for basic operations.
+  In our case, we will use the *write* system call to build a smaller hello world binary and avoid calling an external 
+  glibc function.
+
+  The *write* system call is defined as follows in the manual (man 2 write):
+   
+#+BEGIN_SRC c
+
+   #include <unistd.h>
+
+   ssize_t write(int fd, const void *buf, size_t count);
+
+#+END_SRC 
+       
+  The write system call writes (count) bytes from the byte stream (buf) into a file (fd). As stated before, 
+  stdout (the screen) is a file with a file descriptor value of 1.
+  
+  . The first parameter (fd) is a file descriptor; in our case 1 (stdout = 1). 
+  
+  . The second parameter is a pointer to a byte stream; the "Hello, World\n!" string.
+  
+  . The third parameter is the number of bytes to write from the pointed address into the given file.
+  
+  Now, here's the C program:
+  
+#+BEGIN_SRC c
+
+   #include <unistd.h>
+
+   int main(void)
+   {
+      //1: stdout
+      //string (const char *)
+      //14: length of the string (\n is one character) 
+      write(1, "Hello, World!\n", 14);
+
+      return 0;
+   }
+
+#+END_SRC
+
+    If we compile this program with -O3 and disassemble it::
+
+#+BEGIN_SRC asm
+
+    0000000000001040 <main>:
+    1040:       48 83 ec 08             sub    $0x8,%rsp
+    1044:       ba 0e 00 00 00          mov    $0xe,%edx
+    1049:       bf 01 00 00 00          mov    $0x1,%edi
+    104e:       48 8d 35 af 0f 00 00    lea    0xfaf(%rip),%rsi        # 2004 <_IO_stdin_used+0x4>
+    1055:       e8 d6 ff ff ff          callq  1030 <write@plt>
+    105a:       31 c0                   xor    %eax,%eax
+    105c:       48 83 c4 08             add    $0x8,%rsp
+    1060:       c3                      retq   
+    1061:       66 2e 0f 1f 84 00 00    nopw   %cs:0x0(%rax,%rax,1)
+    1068:       00 00 00 
+    106b:       0f 1f 44 00 00          nopl   0x0(%rax,%rax,1)
+    
+#+END_SRC
+
+  _Observations:_
+    
+  . Useless stack operation 
+
+  . The first parameter register edi is set to 1 (stdout).
+
+  . The second parameter register rsi points to the string address in the .rodata section.
+  
+  . The third parameter register edx is set to 0xe (14 in decimal), the length of the string.
+  
+  . A call to *write* is made (notice the plt is still present)
+  
+  . eax is cleared efficiently with a xor
+  
+  . Useless stack operation
+  
+  . return
+  
+  Same old story as before, glibc functions are still in the binary and rather than call the system
+  directly, the compiler still relies on plt to locate the *write* syscall. Now, this happens because
+  the glic provides wrappers for most system calls. 
+  
+  Now to try to remove the bloat, we will have to invoke the system call without any wrapper.
+  Instead of invoking 'write', we will invoke the kernel syscall handler and pass it the syscall ID
+  and all necessary parameters in hopes this will change something. For more information: *man 2 syscall*.
+  
+  Here is the C code:
+
+#+BEGIN_SRC c
+    
+   #include <unistd.h>
+   #include <sys/syscall.h>
+
+   int main(void)
+   {
+      syscall(SYS_write, 1, "Hello, World!\n", 14);
+       
+      return 0;
+   }
+    
+#+END_SRC
+ 
+  Here is the *main* disassembly with a -O3 optimization flag:
+  
+#+BEGIN_SRC asm
+    
+    0000000000001040 <main>:
+    1040:       48 83 ec 08             sub    $0x8,%rsp
+    1044:       b9 0e 00 00 00          mov    $0xe,%ecx
+    1049:       be 01 00 00 00          mov    $0x1,%esi
+    104e:       31 c0                   xor    %eax,%eax
+    1050:       48 8d 15 ad 0f 00 00    lea    0xfad(%rip),%rdx        # 2004 <_IO_stdin_used+0x4>
+    1057:       bf 01 00 00 00          mov    $0x1,%edi
+    105c:       e8 cf ff ff ff          callq  1030 <syscall@plt>
+    1061:       31 c0                   xor    %eax,%eax
+    1063:       48 83 c4 08             add    $0x8,%rsp
+    1067:       c3                      retq   
+    1068:       0f 1f 84 00 00 00 00    nopl   0x0(%rax,%rax,1)
+    106f:       00
+
+#+END_SRC
+
+  Nothing major, the binary is still dragging plt lookups and is still 16KiB in size. But now that we are here, 
+  we can ask ourselves the following question: how does syscall work?
+  
+  Instead of digging into documentation, let's try something practical. First, let's compile the binary statically
+  and see what the compiler generates.
+  
+  Static compilation implies that the binary file holds within its own code all necessary functions. 
+  This increases the size of the file significantly but allows independance from external libraries. 
+  
+  Here is the command line for dtatic compilation with gcc:
+
+#+BEGIN_SRC shell
+
+   $ gcc -static -O3 main.c -o main
+    
+#+END_SRC
+
+  If we run: *ldd main*, the command will return: /not a dynamic executable/. 
+  Notice, the size of the binary file is gigantic: 747KiB vs 16KiB for the dynamically linked version.
+
+  After disassembly, the main function didn't change much but, now, we can lookup the *syscall* function to check its assembly code.
+    
+#+BEGIN_SRC asm
+
+    0000000000401590 <main>:
+    401590:       48 83 ec 08             sub    $0x8,%rsp
+    401594:       b9 0e 00 00 00          mov    $0xe,%ecx
+    401599:       be 01 00 00 00          mov    $0x1,%esi
+    40159e:       31 c0                   xor    %eax,%eax
+    4015a0:       48 8d 15 5d da 07 00    lea    0x7da5d(%rip),%rdx        # 47f004 <_IO_stdin_used+0x4>
+    4015a7:       bf 01 00 00 00          mov    $0x1,%edi
+    4015ac:       e8 8f cd 03 00          callq  43e340 <syscall>
+    4015b1:       31 c0                   xor    %eax,%eax
+    4015b3:       48 83 c4 08             add    $0x8,%rsp
+    4015b7:       c3                      retq   
+    4015b8:       0f 1f 84 00 00 00 00    nopl   0x0(%rax,%rax,1)
+    4015bf:       00
+
+#+END_SRC
+
+  The code above is similar to: 
+    
+#+BEGIN_SRC c
+
+   syscall(rdi/edi = 1, rsi/esi = 1, rdx/edx = string address, rcx/ecx = 14, ...);
+    
+#+END_SRC
+
+  Now, here's the syscall assembly code found in the binary:
+    
+#+BEGIN_SRC asm
+
+    000000000043e340 <syscall>:
+    43e340:       f3 0f 1e fa             endbr64 
+    43e344:       48 89 f8                mov    %rdi,%rax
+    43e347:       48 89 f7                mov    %rsi,%rdi
+    43e34a:       48 89 d6                mov    %rdx,%rsi
+    43e34d:       48 89 ca                mov    %rcx,%rdx
+    43e350:       4d 89 c2                mov    %r8,%r10
+    43e353:       4d 89 c8                mov    %r9,%r8
+    43e356:       4c 8b 4c 24 08          mov    0x8(%rsp),%r9
+    43e35b:       0f 05                   syscall 
+    43e35d:       48 3d 01 f0 ff ff       cmp    $0xfffffffffffff001,%rax
+    43e363:       73 01                   jae    43e366 <syscall+0x26>
+    43e365:       c3                      retq   
+    43e366:       48 c7 c1 c0 ff ff ff    mov    $0xffffffffffffffc0,%rcx
+    43e36d:       f7 d8                   neg    %eax
+    43e36f:       64 89 01                mov    %eax,%fs:(%rcx)
+    43e372:       48 83 c8 ff             or     $0xffffffffffffffff,%rax
+    43e376:       c3                      retq   
+    43e377:       66 0f 1f 84 00 00 00    nopw   0x0(%rax,%rax,1)
+    43e37e:       00 00 
+    
+#+END_SRC
+
+  Lo and Behold, there is a syscall instruction waiting for us. In fact, the x86-64 architecture
+  provides a syscall instruction that invokes the operating system's syscall handler with ring 0 permissions (root permissions in Linux).
+  
+  Knowing which registers were set for which value in *main*, we can extrapolate from the *syscall* function 
+  definition which registers to set for the syscall instruction.
+    
+|-------------------------------+----------------------------+----------------------------|
+| syscall instruction registers | syscall function registers | value                      |
+|-------------------------------+----------------------------+----------------------------|
+| rax                           | rdi/edi                    | (syscall ID. write = 1)    |
+| rdi                           | rsi/esi                    | (file desc. fd = 1)        |
+| rsi                           | rdx/rdx                    | (string address)           |
+| rdx                           | rcx/ecx                    | (length of the string. 14) |
+|                               |                            |                            |
+|-------------------------------+----------------------------+----------------------------|
+
+  Before we go any deeper, let's ask GCC to generate the assembly code.
+
+#+BEGIN_SRC shell
+    
+   $ gcc -S -O3 main.c
+
+#+END_SRC
+    
+  A file named *main.s* should be generated and it should be quite similar to the following:
+
+#+BEGIN_SRC asm
+    
+    	.file	"main.c"
+	.text
+	.section	.rodata.str1.1,"aMS",@progbits,1
+.LC0:
+	.string	"Hello, World!\n"
+	.section	.text.startup,"ax",@progbits
+	.p2align 4,,15
+	.globl	main
+	.type	main, @function
+main:
+.LFB0:
+	.cfi_startproc
+	subq	$8, %rsp
+	.cfi_def_cfa_offset 16
+	movl	$14, %ecx
+	movl	$1, %esi
+	xorl	%eax, %eax
+	leaq	.LC0(%rip), %rdx
+	movl	$1, %edi
+	call	syscall@PLT
+	xorl	%eax, %eax
+	addq	$8, %rsp
+	.cfi_def_cfa_offset 8
+	ret
+	.cfi_endproc
+.LFE0:
+	.size	main, .-main
+	.ident	"GCC: (GNU) 8.3.0"
+	.section	.note.GNU-stack,"",@progbits
+
+#+END_SRC
+
+  Obviously, even with optimization flags, the GCC compiler didn't generate the most efficient code by removing the syscall function
+  and placing a syscall instruction directly. 
+     
+
+* Hello, World! Down to the core
+
+  With all the knowledge acquired so far, let us now remove the bloat and get down to the core of Hello, World!. 
+ 
+  First, we remove all compiler annotations and useless instructions.
+  Then, we rename the string label (hello) and remove the main function. The *main* function is not necessary in a binary 
+  file. It is considered to be the C program entry point, but the *=_start=* function is the real binary file entry point.
+  We also need to remove the *lea* instruction because there is no need to compute the string address given that we know its location in the 
+  .rodata section.
+  
+  The binary file entry point address can be obtained by running the following command: 
+
+#+BEGIN_SRC bash
+   
+   $ readelf -h main
+
+#+END_SRC
+
+  Inside the *=_start=* function, we set the registers to the proper values and place a syscall instruction rather than
+  a function call. Now, the trick with the *=_start=* function is that it cannot return a value because it is defined as follows:
+
+#+BEGIN_SRC c
+  
+   void _start(void)
+   {
+       int ret = main(argc, argv);
+	       
+       exit(ret);
+   }
+	    
+#+END_SRC
+    
+  The only option available to exactly replicate the behavior of the C program is to exit with a 0 code.
+  Now, *exit* is also a system call (ID = 60), therefore, all we have to do is set the proper registers to the right values
+  and place another syscall instruction in the code.
+  
+  All system call identifiers can be found in the following file: *=/usr/include/asm/unistd_64.h=*
+  
+  And here is the hand optimized assembly code:
+    
+#+BEGIN_SRC asm
+
+	.file		"main.s"
+	.section	.rodata
+	
+hello:
+	.string	"Hello, World!\n"
+	.text
+	.globl	_start
+	.type	_start, @function
+	
+_start:
+	//;; syscall (write, stdout, "Hello, World!\n", 14)
+	movl	$14, %edx     //Move 14 into 32bit edx register 
+	movq	$hello, %rsi  //Move string address into 64bit rsi register (address pointers are 64bit) 
+	movl	$1, %edi      //Move 1 into 32bit edi register
+	movl	$1, %eax      //Move 1 into 32bit eax register
+	syscall
+
+	//;; exit(0)
+	movl    $0, %edi   //Move exit code 0 into edi 
+	movl   $60, %eax   //Move exit syscall ID (60) into eax
+	syscall
+	
+	.size	_start, .-_start
+	.section	.note.GNU-stack,"",@progbits
+
+#+END_SRC
+     
+  To assemble this code & also disassemble it, use the following commands:
+
+#+BEGIN_SRC shell
+    
+   $ gcc -c main.s           #this should generate a main.o file
+   $ ld main.o -o main_asm   #this should generate an executable binary file, main_s
+    
+   $ objdump -D main_asm     #Disassemble the new binary file
+
+       main_asm:     file format elf64-x86-64
+
+
+       Disassembly of section .text:
+       
+       0000000000401000 <.text>:
+       401000:       ba 0e 00 00 00          mov    $0xe,%edx
+       401005:       48 c7 c6 00 20 40 00    mov    $0x402000,%rsi
+       40100c:       bf 01 00 00 00          mov    $0x1,%edi
+       401011:       b8 01 00 00 00          mov    $0x1,%eax
+       401016:       0f 05                   syscall 
+       401018:       bf 00 00 00 00          mov    $0x0,%edi
+       40101d:       b8 3c 00 00 00          mov    $0x3c,%eax
+       401022:       0f 05                   syscall 
+       
+       Disassembly of section .rodata:
+       
+       0000000000402000 <.rodata>:
+       402000:       48                      rex.W
+       402001:       65 6c                   gs insb (%dx),%es:(%rdi)
+       402003:       6c                      insb   (%dx),%es:(%rdi)
+       402004:       6f                      outsl  %ds:(%rsi),(%dx)
+       402005:       2c 20                   sub    $0x20,%al
+       402007:       57                      push   %rdi
+       402008:       6f                      outsl  %ds:(%rsi),(%dx)
+       402009:       72 6c                   jb     0x402077
+       40200b:       64 21 0a                and    %ecx,%fs:(%rdx)
+       
+#+END_SRC
+
+ From the objdump output, it's quite clear we have drastically reduced the code size.
+    
+ Now that we have written our own hello world in assembly, let's compare binary sizes end performance.
+ We will first compare the sizes of different versions: the assembly version, the statically linked version,
+ and the dynamically linked version. Then, we will compare their execution time.
+ 
+ Before stripping the binary files:
+
+#+BEGIN_EXAMPLE
+
+    1. The dynamically linked binary file main_c_d is 17KiB or 16560 bytes long.
+    2. The statically linked binary file main_c_s is 747KiB or 764312 bytes long.
+    3. The assembly version's binary file main_asm is 8.7KiB or 8888 bytes long.
+    
+#+END_EXAMPLE
+
+  if we strip the binary files using the *strip* command:
+
+#+BEGIN_EXAMPLE
+    
+    1. main_c_d: 14352  bytes (15KiB)
+    2. main_c_s: 690872 bytes (675KiB)
+    3. main_asm: 8488   bytes (8.3KiB)
+       
+#+END_EXAMPLE
+       
+  The assembly version's binary is 1.69 times smaller than the dynamically linked binary, and 81.4 times smaller
+  than the statically linked binary.
+  
+  To compare the execution times of these three versions, we will use the *time* command. This command measures the time
+  elapsed from the moment the program is loaded for execution until the moment the program exits.
+  
+  Given that printing a string isn't a heavy workload, the programs are going to run extremely fast and the time command
+  accuracy will be questionable for such short executions. In other words, the programs are too small to be measured
+  accurately using the *time* command, we will need a much accurate timer (i.e. RDTSC).    
+
+  But, to avoid this issue, we will run each binary 10000 times and consider the 10000 executions a single run.
+  This is by no means a reliable way to perform performance measurements but it works for this case.
+  
+#+BEGIN_SRC shell
+
+    #Assembly version
+    time for i in $( seq 1 10000 ); do ./main_asm; done
+    
+    real    0m8.321s
+    user    0m6.110s
+    sys     0m2.429s
+
+    time for i in $( seq 1 10000 ); do ./main_c_d; done
+    
+    real    0m11.406s
+    user    0m7.903s
+    sys     0m3.697s
+    
+    time for i in $( seq 1 10000 ); do ./main_c_s; done
+
+    real    0m9.260s
+    user    0m6.731s
+    sys     0m2.746s
+    
+#+END_SRC
+
+  Voilà! 
+
+  Obviously, the assembly version is faster and more size efficient but 8.3KiB for a hello world is far too much for my taste. 
+
+
+* Hello, World! The stillness at the core.
+
+  So far, we have seen how we can build a much smaller binary file than te compiler by writing our own assembly code to circumvent
+  the additional useless code that the compiler adds to the binary file. Yet, 8.3KiB isn't small, we're still stuck with kilobytes of useless code. 
+  There are still many useless sections and file information of no benefit for our endeavor.
+   
+  This time, we are going to avoid using the compiler and handcraft the smallest ELF binary possible for the task.
+   
+  Yes, we are going to make an ELF binary file by hand.
+   
+  The ELF format is a description of how and where data and instructions are to be stored when generating an executable file.
+  This format describes header structures which contain all necessary information about the binary file's structure in order 
+  for it to be loaded and executed properly.
+  
+  The ELF data structures and field values can be found in the following file: *=/usr/include/elf.h=*.
+  
+  The following is the ELF file header structure. This appears at the beginning of every ELF file.   
+  
+#+BEGIN_SRC c
+   
+   typedef struct
+   {
+   unsigned char e_ident[EI_NIDENT];     /* Magic number and other info */
+   Elf64_Half    e_type;                 /* Object file type */
+   Elf64_Half    e_machine;              /* Architecture */
+   Elf64_Word    e_version;              /* Object file version */
+   Elf64_Addr    e_entry;                /* Entry point virtual address */
+   Elf64_Off     e_phoff;                /* Program header table file offset */
+   Elf64_Off     e_shoff;                /* Section header table file offset */
+   Elf64_Word    e_flags;                /* Processor-specific flags */
+   Elf64_Half    e_ehsize;               /* ELF header size in bytes */
+   Elf64_Half    e_phentsize;            /* Program header table entry size */
+   Elf64_Half    e_phnum;                /* Program header table entry count */
+   Elf64_Half    e_shentsize;            /* Section header table entry size */
+   Elf64_Half    e_shnum;                /* Section header table entry count */
+   Elf64_Half    e_shstrndx;             /* Section header string table index */
+   } Elf64_Ehdr;
+
+#+END_SRC
+   
+  And this, is the program segment header:
+
+#+BEGIN_SRC c
+   
+   typedef struct
+   {
+   Elf64_Word    p_type;                 /* Segment type */
+   Elf64_Word    p_flags;                /* Segment flags */
+   Elf64_Off     p_offset;               /* Segment file offset */
+   Elf64_Addr    p_vaddr;                /* Segment virtual address */
+   Elf64_Addr    p_paddr;                /* Segment physical address */
+   Elf64_Xword   p_filesz;               /* Segment size in file */
+   Elf64_Xword   p_memsz;                /* Segment size in memory */
+   Elf64_Xword   p_align;                /* Segment alignment */
+   } Elf64_Phdr;
+   
+   #+END_SRC
+   
+  These two headers are the only structures needed in the binary file for it be valid. By only defining
+  the necessary header entries and values, we reach a minimal file structure.
+  
+  This said, here's the commented assembly code:
+
+#+BEGIN_SRC asm
+
+;; 64 bit mode
+BITS 64
+
+;; Where the program is loaded in memory
+org 0x400000;
+
+;; Entry header 	
+ehdr:   	 ; Elf64_Ehdr
+
+	;; Magic number 0x7F454C46020101000000000000000000
+
+	;; First half:  0x7F454C4602010100, E(45) L(4C) F(46)
+	db 0x7f,	 "ELF", 2, 1, 1, 0 ; e_ident
+	
+	;; Second half: 0x0000000000000000
+	times 8 db 0	
+
+	;; Header fields
+	dw  2         	; e_type     - 2 		--> executable file
+	dw  0x3e      	; e_machine  - 0x3e = 62 	--> x86_64
+	dw  1         	; e_version 
+	dq  _start    	; e_entry    - entry point	--> _start
+	dq  phdr - $$ 	; e_phoff    - phdr offset 
+	dq  0         	; e_shoff    - no section header
+	dd  0         	; e_flags    - no special CPU flags
+	dw  ehdr_size  	; e_ehsize
+	dw  phdr_size  	; e_phentsize
+	dw  1         	; e_phnum     - only one program header entry
+	dw  0         	; e_shentsize - empty
+	dw  0         	; e_shnum     - empty
+	dw  0         	; e_shstrndx  - empty
+	
+	ehdr_size  equ  $ - ehdr ; calculate the size of ehdr ==> size = current address - ehdr address
+	
+;; Program header
+phdr:           ; Elf64_Phdr
+
+	dd  1         	; p_type	- 1 	--> loadable program segment
+	dd  1         	; p_flags	- 1	--> executable segment 
+	dq  0         	; p_offset	- no offset
+	dq  $$        	; p_vaddr	- address
+	dq  $$        	; p_paddr	- address
+	dq  file_size  	; p_filesz 	
+	dq  file_size  	; p_memsz
+	dq  0x1000    	; p_align	- 4K alignment
+	
+	phdr_size  equ  $ - phdr ; calculate the size of phdr
+	 
+;; File entry point
+_start:
+
+	;; syscall(SYS_write, 1, "Hello, World!\n", 14);
+	mov rdx, hello_size
+	mov rsi, hello
+	mov rdi, 1
+	mov rax, 1
+	syscall
+
+	;; syscal(SYS_exit, 0);
+	mov rax, 60 ; exit syscall
+	mov rdi,  0 ; exit status 0
+	syscall
+
+;; 
+hello:	db "Hello, World!", 10  ; 10 --> '\n'
+	
+	hello_size equ $ - hello ; size of the hello string (14 bytes)
+	
+	file_size  equ  $ - $$ 	; calculate the whole program size in bytes
+
+#+END_SRC
+   
+  The assembly code above sets every ELF header field to a valid value taking into account each field's size.
+   
+  The db, dw, dd, and dq pseudo-instructions are handled by the *nasm* assembler as data definition directives.
+  
+     - db defines a byte (8 bits) or a series of bytes/characters (string) to a given value.
+  
+     - dw defines a word (16 bits) to a given value.
+  
+     - dd defines a double word (32 bits) value.
+
+     - dq defines a quadword (64 bits) value. 
+
+  Once the data fields set, the program performs the same syscall procedure as before.
+   
+  To assemble the code above use the following commands:
+   
+#+BEGIN_SRC shell
+   
+   $ nasm -f bin main.asm -o main # Assemble and create the binary file
+   
+   $ chmod +x main                # Make the binary file executable
+
+   $ wc -c main                   # Count the number of bytes in the binary file  
+      173 main
+
+#+END_SRC
+
+  Now, how big is this binary file?
+
+  _Answer:_ 173 bytes.
+
+  The new binary file is 82.95 times smaller than the dynamically linked version, 49.06 times smaller than 
+  the previous assembly version, and 3993.47 times smaller than the statically linked version.
+
+  How fast is this binary file compared to the previous versions?
+
+#+BEGIN_SRC shell
+   
+   time for i in $( seq 1 10000 ); do ./main >> /dev/null; done
+   
+   real    0m4.018s
+   user    0m2.690s
+   sys     0m1.698s
+   
+#+END_SRC
+      
+
+* References 
+
+  - http://john.freml.in/amd64-nopl
+
+  - https://nasm.us/doc/nasmdoc3.html
+
+  - https://uclibc.org/docs/elf-64-gen.pdf
+
+  - https://www.felixcloutier.com/x86/syscall
+
+  - https://en.wikipedia.org/wiki/X86_calling_conventions
+
+  - http://gcc.gnu.org/onlinedocs/gcc/Optimize-Options.html
+
+  - https://en.wikipedia.org/wiki/Application_binary_interface
+
+  - https://blog.rchapman.org/posts/Linux_System_Call_Table_for_x86_64/
